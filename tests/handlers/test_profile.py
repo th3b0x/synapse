@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-from mock import Mock, NonCallableMock
+from mock import Mock
 
 from twisted.internet import defer
 
@@ -55,11 +55,7 @@ class ProfileTestCase(unittest.TestCase):
             federation_client=self.mock_federation,
             federation_server=Mock(),
             federation_registry=self.mock_registry,
-            ratelimiter=NonCallableMock(spec_set=["can_do_action"]),
         )
-
-        self.ratelimiter = hs.get_ratelimiter()
-        self.ratelimiter.can_do_action.return_value = (True, 0)
 
         self.store = hs.get_datastore()
 
@@ -76,7 +72,9 @@ class ProfileTestCase(unittest.TestCase):
     def test_get_my_name(self):
         yield self.store.set_profile_displayname(self.frank.localpart, "Frank")
 
-        displayname = yield self.handler.get_displayname(self.frank)
+        displayname = yield defer.ensureDeferred(
+            self.handler.get_displayname(self.frank)
+        )
 
         self.assertEquals("Frank", displayname)
 
@@ -144,7 +142,9 @@ class ProfileTestCase(unittest.TestCase):
             {"displayname": "Alice"}
         )
 
-        displayname = yield self.handler.get_displayname(self.alice)
+        displayname = yield defer.ensureDeferred(
+            self.handler.get_displayname(self.alice)
+        )
 
         self.assertEquals(displayname, "Alice")
         self.mock_federation.make_query.assert_called_with(
@@ -159,8 +159,10 @@ class ProfileTestCase(unittest.TestCase):
         yield self.store.create_profile("caroline")
         yield self.store.set_profile_displayname("caroline", "Caroline")
 
-        response = yield self.query_handlers["profile"](
-            {"user_id": "@caroline:test", "field": "displayname"}
+        response = yield defer.ensureDeferred(
+            self.query_handlers["profile"](
+                {"user_id": "@caroline:test", "field": "displayname"}
+            )
         )
 
         self.assertEquals({"displayname": "Caroline"}, response)
@@ -170,8 +172,7 @@ class ProfileTestCase(unittest.TestCase):
         yield self.store.set_profile_avatar_url(
             self.frank.localpart, "http://my.server/me.png"
         )
-
-        avatar_url = yield self.handler.get_avatar_url(self.frank)
+        avatar_url = yield defer.ensureDeferred(self.handler.get_avatar_url(self.frank))
 
         self.assertEquals("http://my.server/me.png", avatar_url)
 

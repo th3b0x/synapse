@@ -17,8 +17,6 @@
 import logging
 from collections import namedtuple
 
-from six import iteritems, itervalues
-
 from prometheus_client import Counter
 
 from twisted.internet import defer
@@ -51,6 +49,7 @@ push_rules_delta_state_cache_metric = register_cache(
     "cache",
     "push_rules_delta_state_cache_metric",
     cache=[],  # Meaningless size, as this isn't a cache that stores values
+    resizable=False,
 )
 
 
@@ -67,7 +66,8 @@ class BulkPushRuleEvaluator(object):
         self.room_push_rule_cache_metrics = register_cache(
             "cache",
             "room_push_rule_cache",
-            cache=[],  # Meaningless size, as this isn't a cache that stores values
+            cache=[],  # Meaningless size, as this isn't a cache that stores values,
+            resizable=False,
         )
 
     @defer.inlineCallbacks
@@ -128,7 +128,7 @@ class BulkPushRuleEvaluator(object):
                 event, prev_state_ids, for_verification=False
             )
             auth_events = yield self.store.get_events(auth_events_ids)
-            auth_events = {(e.type, e.state_key): e for e in itervalues(auth_events)}
+            auth_events = {(e.type, e.state_key): e for e in auth_events.values()}
 
         sender_level = get_user_power_level(event.sender, auth_events)
 
@@ -160,7 +160,7 @@ class BulkPushRuleEvaluator(object):
 
         condition_cache = {}
 
-        for uid, rules in iteritems(rules_by_user):
+        for uid, rules in rules_by_user.items():
             if event.sender == uid:
                 continue
 
@@ -393,7 +393,7 @@ class RulesForRoom(object):
         # If the event is a join event then it will be in current state evnts
         # map but not in the DB, so we have to explicitly insert it.
         if event.type == EventTypes.Member:
-            for event_id in itervalues(member_event_ids):
+            for event_id in member_event_ids.values():
                 if event_id == event.event_id:
                     members[event_id] = (event.state_key, event.membership)
 
@@ -402,7 +402,7 @@ class RulesForRoom(object):
 
         interested_in_user_ids = {
             user_id
-            for user_id, membership in itervalues(members)
+            for user_id, membership in members.values()
             if membership == Membership.JOIN
         }
 
@@ -413,7 +413,7 @@ class RulesForRoom(object):
         )
 
         user_ids = {
-            uid for uid, have_pusher in iteritems(if_users_with_pushers) if have_pusher
+            uid for uid, have_pusher in if_users_with_pushers.items() if have_pusher
         }
 
         logger.debug("With pushers: %r", user_ids)
@@ -434,7 +434,7 @@ class RulesForRoom(object):
         )
 
         ret_rules_by_user.update(
-            item for item in iteritems(rules_by_user) if item[0] is not None
+            item for item in rules_by_user.items() if item[0] is not None
         )
 
         self.update_cache(sequence, members, ret_rules_by_user, state_group)

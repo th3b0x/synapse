@@ -1,3 +1,5 @@
+from typing import Dict
+
 import twisted.internet
 
 import synapse.api.auth
@@ -18,7 +20,9 @@ import synapse.handlers.room
 import synapse.handlers.room_member
 import synapse.handlers.set_password
 import synapse.http.client
+import synapse.http.matrixfederationclient
 import synapse.notifier
+import synapse.push.pusherpool
 import synapse.replication.tcp.client
 import synapse.replication.tcp.handler
 import synapse.rest.media.v1.media_repository
@@ -27,6 +31,7 @@ import synapse.server_notices.server_notices_sender
 import synapse.state
 import synapse.storage
 from synapse.events.builder import EventBuilderFactory
+from synapse.replication.tcp.streams import Stream
 
 class HomeServer(object):
     @property
@@ -66,6 +71,8 @@ class HomeServer(object):
     def get_room_creation_handler(self) -> synapse.handlers.room.RoomCreationHandler:
         pass
     def get_room_member_handler(self) -> synapse.handlers.room_member.RoomMemberHandler:
+        pass
+    def get_room_shutdown_handler(self) -> synapse.handlers.room.RoomShutdownHandler:
         pass
     def get_event_creation_handler(
         self,
@@ -132,4 +139,14 @@ class HomeServer(object):
     def get_registration_handler(self) -> synapse.handlers.register.RegistrationHandler:
         pass
     def get_macaroon_generator(self) -> synapse.handlers.auth.MacaroonGenerator:
+        pass
+    def get_pusherpool(self) -> synapse.push.pusherpool.PusherPool:
+        pass
+    def get_replication_streams(self) -> Dict[str, Stream]:
+        pass
+    def get_http_client(
+        self,
+    ) -> synapse.http.matrixfederationclient.MatrixFederationHttpClient:
+        pass
+    def should_send_federation(self) -> bool:
         pass

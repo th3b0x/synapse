@@ -19,9 +19,6 @@ import random
 from abc import ABCMeta
 from typing import Any, Optional
 
-from six import PY2
-from six.moves import builtins
-
 from canonicaljson import json
 
 from synapse.storage.database import LoggingTransaction  # noqa: F401
@@ -103,13 +100,8 @@ def db_to_json(db_content):
     if isinstance(db_content, memoryview):
         db_content = db_content.tobytes()
 
-    # psycopg2 on Python 2 returns buffer objects, which we need to cast to
-    # bytes to decode
-    if PY2 and isinstance(db_content, builtins.buffer):
-        db_content = bytes(db_content)
-
-    # Decode it to a Unicode string before feeding it to json.loads, so we
-    # consistenty get a Unicode-containing object out.
+    # Decode it to a Unicode string before feeding it to json.loads, since
+    # Python 3.5 does not support deserializing bytes.
     if isinstance(db_content, (bytes, bytearray)):
         db_content = db_content.decode("utf8")
 

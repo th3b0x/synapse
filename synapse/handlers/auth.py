@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import logging
 import time
 import unicodedata
@@ -24,7 +23,6 @@ import attr
 import bcrypt  # type: ignore[import]
 import pymacaroons
 
-import synapse.util.stringutils as stringutils
 from synapse.api.constants import LoginType
 from synapse.api.errors import (
     AuthError,
@@ -38,13 +36,15 @@ from synapse.api.errors import (
 from synapse.api.ratelimiting import Ratelimiter
 from synapse.handlers.ui_auth import INTERACTIVE_AUTH_CHECKERS
 from synapse.handlers.ui_auth.checkers import UserInteractiveAuthChecker
-from synapse.http.server import finish_request
+from synapse.http.server import finish_request, respond_with_html
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import defer_to_thread
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
 from synapse.push.mailer import load_jinja2_templates
 from synapse.types import Requester, UserID
+from synapse.util import stringutils as stringutils
+from synapse.util.threepids import canonicalise_email
 
 from ._base import BaseHandler
 
@@ -80,7 +80,9 @@ class AuthHandler(BaseHandler):
         self.hs = hs  # FIXME better possibility to access registrationHandler later?
         self.macaroon_gen = hs.get_macaroon_generator()
         self._password_enabled = hs.config.password_enabled
-        self._sso_enabled = hs.config.saml2_enabled or hs.config.cas_enabled
+        self._sso_enabled = (
+            hs.config.cas_enabled or hs.config.saml2_enabled or hs.config.oidc_enabled
+        )
 
         # we keep this as a list despite the O(N^2) implication so that we can
         # keep PASSWORD first and avoid confusing clients which pick the first
@@ -106,7 +108,11 @@ class AuthHandler(BaseHandler):
 
         # Ratelimiter for failed auth during UIA. Uses same ratelimit config
         # as per `rc_login.failed_attempts`.
-        self._failed_uia_attempts_ratelimiter = Ratelimiter()
+        self._failed_uia_attempts_ratelimiter = Ratelimiter(
+            clock=self.clock,
+            rate_hz=self.hs.config.rc_login_failed_attempts.per_second,
+            burst_count=self.hs.config.rc_login_failed_attempts.burst_count,
+        )
 
         self._clock = self.hs.get_clock()
 
@@ -194,13 +200,7 @@ class AuthHandler(BaseHandler):
         user_id = requester.user.to_string()
 
         # Check if we should be ratelimited due to too many previous failed attempts
-        self._failed_uia_attempts_ratelimiter.ratelimit(
-            user_id,
-            time_now_s=self._clock.time(),
-            rate_hz=self.hs.config.rc_login_failed_attempts.per_second,
-            burst_count=self.hs.config.rc_login_failed_attempts.burst_count,
-            update=False,
-        )
+        self._failed_uia_attempts_ratelimiter.ratelimit(user_id, update=False)
 
         # build a list of supported flows
         flows = [[login_type] for login_type in self._supported_ui_auth_types]
@@ -210,14 +210,8 @@ class AuthHandler(BaseHandler):
                 flows, request, request_body, clientip, description
             )
         except LoginError:
-            # Update the ratelimite to say we failed (`can_do_action` doesn't raise).
-            self._failed_uia_attempts_ratelimiter.can_do_action(
-                user_id,
-                time_now_s=self._clock.time(),
-                rate_hz=self.hs.config.rc_login_failed_attempts.per_second,
-                burst_count=self.hs.config.rc_login_failed_attempts.burst_count,
-                update=True,
-            )
+            # Update the ratelimiter to say we failed (`can_do_action` doesn't raise).
+            self._failed_uia_attempts_ratelimiter.can_do_action(user_id)
             raise
 
         # find the completed login type
@@ -303,7 +297,7 @@ class AuthHandler(BaseHandler):
 
         # Convert the URI and method to strings.
         uri = request.uri.decode("utf-8")
-        method = request.uri.decode("utf-8")
+        method = request.method.decode("utf-8")
 
         # If there's no session ID, create a new session.
         if not sid:
@@ -317,29 +311,54 @@ class AuthHandler(BaseHandler):
             except StoreError:
                 raise SynapseError(400, "Unknown session ID: %s" % (sid,))
 
+            # If the client provides parameters, update what is persisted,
+            # otherwise use whatever was last provided.
+            #
+            # This was designed to allow the client to omit the parameters
+            # and just supply the session in subsequent calls so it split
+            # auth between devices by just sharing the session, (eg. so you
+            # could continue registration from your phone having clicked the
+            # email auth link on there). It's probably too open to abuse
+            # because it lets unauthenticated clients store arbitrary objects
+            # on a homeserver.
+            #
+            # Revisit: Assuming the REST APIs do sensible validation, the data
+            # isn't arbitrary.
+            #
+            # Note that the registration endpoint explicitly removes the
+            # "initial_device_display_name" parameter if it is provided
+            # without a "password" parameter. See the changes to
+            # synapse.rest.client.v2_alpha.register.RegisterRestServlet.on_POST
+            # in commit 544722bad23fc31056b9240189c3cbbbf0ffd3f9.
             if not clientdict:
-                # This was designed to allow the client to omit the parameters
-                # and just supply the session in subsequent calls so it split
-                # auth between devices by just sharing the session, (eg. so you
-                # could continue registration from your phone having clicked the
-                # email auth link on there). It's probably too open to abuse
-                # because it lets unauthenticated clients store arbitrary objects
-                # on a homeserver.
-                # Revisit: Assuming the REST APIs do sensible validation, the data
-                # isn't arbitrary.
                 clientdict = session.clientdict
 
             # Ensure that the queried operation does not vary between stages of
             # the UI authentication session. This is done by generating a stable
-            # comparator based on the URI, method, and body (minus the auth dict)
-            # and storing it during the initial query. Subsequent queries ensure
-            # that this comparator has not changed.
-            comparator = (uri, method, clientdict)
-            if (session.uri, session.method, session.clientdict) != comparator:
+            # comparator and storing it during the initial query. Subsequent
+            # queries ensure that this comparator has not changed.
+            #
+            # The comparator is based on the requested URI and HTTP method. The
+            # client dict (minus the auth dict) should also be checked, but some
+            # clients are not spec compliant, just warn for now if the client
+            # dict changes.
+            if (session.uri, session.method) != (uri, method):
                 raise SynapseError(
                     403,
                     "Requested operation has changed during the UI authentication session.",
                 )
+
+            if session.clientdict != clientdict:
+                logger.warning(
+                    "Requested operation has changed during the UI "
+                    "authentication session. A future version of Synapse "
+                    "will remove this capability."
+                )
+
+            # For backwards compatibility, changes to the client dict are
+            # persisted as clients modify them throughout their user interactive
+            # authentication flow.
+            await self.store.set_ui_auth_clientdict(sid, clientdict)
 
         if not authdict:
             raise InteractiveAuthIncompleteError(
@@ -909,7 +928,7 @@ class AuthHandler(BaseHandler):
         # for the presence of an email address during password reset was
         # case sensitive).
         if medium == "email":
-            address = address.lower()
+            address = canonicalise_email(address)
 
         await self.store.user_add_threepid(
             user_id, medium, address, validated_at, self.hs.get_clock().time_msec()
@@ -937,7 +956,7 @@ class AuthHandler(BaseHandler):
 
         # 'Canonicalise' email addresses as per above
         if medium == "email":
-            address = address.lower()
+            address = canonicalise_email(address)
 
         identity_handler = self.hs.get_handlers().identity_handler
         result = await identity_handler.try_unbind_threepid(
@@ -1036,13 +1055,8 @@ class AuthHandler(BaseHandler):
         )
 
         # Render the HTML and return.
-        html_bytes = self._sso_auth_success_template.encode("utf-8")
-        request.setResponseCode(200)
-        request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
-        request.setHeader(b"Content-Length", b"%d" % (len(html_bytes),))
-
-        request.write(html_bytes)
-        finish_request(request)
+        html = self._sso_auth_success_template
+        respond_with_html(request, 200, html)
 
     async def complete_sso_login(
         self,
@@ -1062,13 +1076,7 @@ class AuthHandler(BaseHandler):
         # flow.
         deactivated = await self.store.get_user_deactivated_status(registered_user_id)
         if deactivated:
-            html_bytes = self._sso_account_deactivated_template.encode("utf-8")
-
-            request.setResponseCode(403)
-            request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
-            request.setHeader(b"Content-Length", b"%d" % (len(html_bytes),))
-            request.write(html_bytes)
-            finish_request(request)
+            respond_with_html(request, 403, self._sso_account_deactivated_template)
             return
 
         self._complete_sso_login(registered_user_id, request, client_redirect_url)
@@ -1109,17 +1117,12 @@ class AuthHandler(BaseHandler):
         # URL we redirect users to.
         redirect_url_no_params = client_redirect_url.split("?")[0]
 
-        html_bytes = self._sso_redirect_confirm_template.render(
+        html = self._sso_redirect_confirm_template.render(
             display_url=redirect_url_no_params,
             redirect_url=redirect_url,
             server_name=self._server_name,
-        ).encode("utf-8")
-
-        request.setResponseCode(200)
-        request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
-        request.setHeader(b"Content-Length", b"%d" % (len(html_bytes),))
-        request.write(html_bytes)
-        finish_request(request)
+        )
+        respond_with_html(request, 200, html)
 
     @staticmethod
     def add_query_param_to_url(url: str, param_name: str, param: Any):

@@ -21,8 +21,6 @@ from abc import abstractmethod
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from six import integer_types
-
 from canonicaljson import json
 
 from twisted.internet import defer
@@ -30,7 +28,7 @@ from twisted.internet import defer
 from synapse.api.constants import EventTypes
 from synapse.api.errors import StoreError
 from synapse.api.room_versions import RoomVersion, RoomVersions
-from synapse.storage._base import SQLBaseStore
+from synapse.storage._base import SQLBaseStore, db_to_json
 from synapse.storage.data_stores.main.search import SearchStore
 from synapse.storage.database import Database, LoggingTransaction
 from synapse.types import ThirdPartyInstanceID
@@ -120,7 +118,12 @@ class RoomWorkerStore(SQLBaseStore):
                 WHERE room_id = ?
                 """
             txn.execute(sql, [room_id])
-            res = self.db.cursor_to_dict(txn)[0]
+            # Catch error if sql returns empty result to return "None" instead of an error
+            try:
+                res = self.db.cursor_to_dict(txn)[0]
+            except IndexError:
+                return None
+
             res["federatable"] = bool(res["federatable"])
             res["public"] = bool(res["public"])
             return res
@@ -628,35 +631,9 @@ class RoomWorkerStore(SQLBaseStore):
 
         def _quarantine_media_in_room_txn(txn):
             local_mxcs, remote_mxcs = self._get_media_mxcs_in_room_txn(txn, room_id)
-            total_media_quarantined = 0
-
-            # Now update all the tables to set the quarantined_by flag
-
-            txn.executemany(
-                """
-                UPDATE local_media_repository
-                SET quarantined_by = ?
-                WHERE media_id = ?
-            """,
-                ((quarantined_by, media_id) for media_id in local_mxcs),
+            return self._quarantine_media_txn(
+                txn, local_mxcs, remote_mxcs, quarantined_by
             )
-
-            txn.executemany(
-                """
-                    UPDATE remote_media_cache
-                    SET quarantined_by = ?
-                    WHERE media_origin = ? AND media_id = ?
-                """,
-                (
-                    (quarantined_by, origin, media_id)
-                    for origin, media_id in remote_mxcs
-                ),
-            )
-
-            total_media_quarantined += len(local_mxcs)
-            total_media_quarantined += len(remote_mxcs)
-
-            return total_media_quarantined
 
         return self.db.runInteraction(
             "quarantine_media_in_room", _quarantine_media_in_room_txn
@@ -693,7 +670,7 @@ class RoomWorkerStore(SQLBaseStore):
             next_token = None
             for stream_ordering, content_json in txn:
                 next_token = stream_ordering
-                event_json = json.loads(content_json)
+                event_json = db_to_json(content_json)
                 content = event_json["content"]
                 content_url = content.get("url")
                 thumbnail_url = content.get("info", {}).get("thumbnail_url")
@@ -807,17 +784,17 @@ class RoomWorkerStore(SQLBaseStore):
         Returns:
             The total number of media items quarantined
         """
-        total_media_quarantined = 0
-
         # Update all the tables to set the quarantined_by flag
         txn.executemany(
             """
             UPDATE local_media_repository
             SET quarantined_by = ?
-            WHERE media_id = ?
+            WHERE media_id = ? AND safe_from_quarantine = ?
         """,
-            ((quarantined_by, media_id) for media_id in local_mxcs),
+            ((quarantined_by, media_id, False) for media_id in local_mxcs),
         )
+        # Note that a rowcount of -1 can be used to indicate no rows were affected.
+        total_media_quarantined = txn.rowcount if txn.rowcount > 0 else 0
 
         txn.executemany(
             """
@@ -827,13 +804,36 @@ class RoomWorkerStore(SQLBaseStore):
             """,
             ((quarantined_by, origin, media_id) for origin, media_id in remote_mxcs),
         )
-
-        total_media_quarantined += len(local_mxcs)
-        total_media_quarantined += len(remote_mxcs)
+        total_media_quarantined += txn.rowcount if txn.rowcount > 0 else 0
 
         return total_media_quarantined
 
-    def get_all_new_public_rooms(self, prev_id, current_id, limit):
+    async def get_all_new_public_rooms(
+        self, instance_name: str, last_id: int, current_id: int, limit: int
+    ) -> Tuple[List[Tuple[int, tuple]], int, bool]:
+        """Get updates for public rooms replication stream.
+
+        Args:
+            instance_name: The writer we want to fetch updates from. Unused
+                here since there is only ever one writer.
+            last_id: The token to fetch updates from. Exclusive.
+            current_id: The token to fetch updates up to. Inclusive.
+            limit: The requested limit for the number of rows to return. The
+                function may return more or fewer rows.
+
+        Returns:
+            A tuple consisting of: the updates, a token to use to fetch
+            subsequent updates, and whether we returned fewer rows than exists
+            between the requested tokens due to the limit.
+
+            The token returned can be used in a subsequent call to this
+            function to get further updatees.
+
+            The updates are a list of 2-tuples of stream ID and the row data
+        """
+        if last_id == current_id:
+            return [], current_id, False
+
         def get_all_new_public_rooms(txn):
             sql = """
                 SELECT stream_id, room_id, visibility, appservice_id, network_id
@@ -843,13 +843,17 @@ class RoomWorkerStore(SQLBaseStore):
                 LIMIT ?
             """
 
-            txn.execute(sql, (prev_id, current_id, limit))
-            return txn.fetchall()
+            txn.execute(sql, (last_id, current_id, limit))
+            updates = [(row[0], row[1:]) for row in txn]
+            limited = False
+            upto_token = current_id
+            if len(updates) >= limit:
+                upto_token = updates[-1][0]
+                limited = True
 
-        if prev_id == current_id:
-            return defer.succeed([])
+            return updates, upto_token, limited
 
-        return self.db.runInteraction(
+        return await self.db.runInteraction(
             "get_all_new_public_rooms", get_all_new_public_rooms
         )
 
@@ -911,8 +915,8 @@ class RoomBackgroundUpdateStore(SQLBaseStore):
                 if not row["json"]:
                     retention_policy = {}
                 else:
-                    ev = json.loads(row["json"])
-                    retention_policy = json.dumps(ev["content"])
+                    ev = db_to_json(row["json"])
+                    retention_policy = ev["content"]
 
                 self.db.simple_insert_txn(
                     txn=txn,
@@ -967,7 +971,7 @@ class RoomBackgroundUpdateStore(SQLBaseStore):
 
             updates = []
             for room_id, event_json in txn:
-                event_dict = json.loads(event_json)
+                event_dict = db_to_json(event_json)
                 room_version_id = event_dict.get("content", {}).get(
                     "room_version", RoomVersions.V1.identifier
                 )
@@ -1301,53 +1305,6 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore, SearchStore):
             return row[0] or 0
 
         return self.db.runInteraction("get_rooms", f)
-
-    def _store_room_topic_txn(self, txn, event):
-        if hasattr(event, "content") and "topic" in event.content:
-            self.store_event_search_txn(
-                txn, event, "content.topic", event.content["topic"]
-            )
-
-    def _store_room_name_txn(self, txn, event):
-        if hasattr(event, "content") and "name" in event.content:
-            self.store_event_search_txn(
-                txn, event, "content.name", event.content["name"]
-            )
-
-    def _store_room_message_txn(self, txn, event):
-        if hasattr(event, "content") and "body" in event.content:
-            self.store_event_search_txn(
-                txn, event, "content.body", event.content["body"]
-            )
-
-    def _store_retention_policy_for_room_txn(self, txn, event):
-        if hasattr(event, "content") and (
-            "min_lifetime" in event.content or "max_lifetime" in event.content
-        ):
-            if (
-                "min_lifetime" in event.content
-                and not isinstance(event.content.get("min_lifetime"), integer_types)
-            ) or (
-                "max_lifetime" in event.content
-                and not isinstance(event.content.get("max_lifetime"), integer_types)
-            ):
-                # Ignore the event if one of the value isn't an integer.
-                return
-
-            self.db.simple_insert_txn(
-                txn=txn,
-                table="room_retention",
-                values={
-                    "room_id": event.room_id,
-                    "event_id": event.event_id,
-                    "min_lifetime": event.content.get("min_lifetime"),
-                    "max_lifetime": event.content.get("max_lifetime"),
-                },
-            )
-
-            self._invalidate_cache_and_stream(
-                txn, self.get_retention_policy_for_room, (event.room_id,)
-            )
 
     def add_event_report(
         self, room_id, event_id, user_id, reason, content, received_ts

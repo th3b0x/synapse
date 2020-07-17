@@ -12,15 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
 from typing import Any, Dict, Optional, Union
 
 import attr
+from canonicaljson import json
 
-import synapse.util.stringutils as stringutils
 from synapse.api.errors import StoreError
-from synapse.storage._base import SQLBaseStore
+from synapse.storage._base import SQLBaseStore, db_to_json
 from synapse.types import JsonDict
+from synapse.util import stringutils as stringutils
 
 
 @attr.s
@@ -118,7 +118,7 @@ class UIAuthWorkerStore(SQLBaseStore):
             desc="get_ui_auth_session",
         )
 
-        result["clientdict"] = json.loads(result["clientdict"])
+        result["clientdict"] = db_to_json(result["clientdict"])
 
         return UIAuthSessionData(session_id, **result)
 
@@ -168,9 +168,30 @@ class UIAuthWorkerStore(SQLBaseStore):
             retcols=("stage_type", "result"),
             desc="get_completed_ui_auth_stages",
         ):
-            results[row["stage_type"]] = json.loads(row["result"])
+            results[row["stage_type"]] = db_to_json(row["result"])
 
         return results
+
+    async def set_ui_auth_clientdict(
+        self, session_id: str, clientdict: JsonDict
+    ) -> None:
+        """
+        Store an updated clientdict for a given session ID.
+
+        Args:
+            session_id: The ID of this session as returned from check_auth
+            clientdict:
+                The dictionary from the client root level, not the 'auth' key.
+        """
+        # The clientdict gets stored as JSON.
+        clientdict_json = json.dumps(clientdict)
+
+        await self.db.simple_update_one(
+            table="ui_auth_sessions",
+            keyvalues={"session_id": session_id},
+            updatevalues={"clientdict": clientdict_json},
+            desc="set_ui_auth_client_dict",
+        )
 
     async def set_ui_auth_session_data(self, session_id: str, key: str, value: Any):
         """
@@ -203,7 +224,7 @@ class UIAuthWorkerStore(SQLBaseStore):
         )
 
         # Update it and add it back to the database.
-        serverdict = json.loads(result["serverdict"])
+        serverdict = db_to_json(result["serverdict"])
         serverdict[key] = value
 
         self.db.simple_update_one_txn(
@@ -233,7 +254,7 @@ class UIAuthWorkerStore(SQLBaseStore):
             desc="get_ui_auth_session_data",
         )
 
-        serverdict = json.loads(result["serverdict"])
+        serverdict = db_to_json(result["serverdict"])
 
         return serverdict.get(key, default)
 

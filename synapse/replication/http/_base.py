@@ -16,11 +16,9 @@
 import abc
 import logging
 import re
+import urllib
 from inspect import signature
 from typing import Dict, List, Tuple
-
-from six import raise_from
-from six.moves import urllib
 
 from twisted.internet import defer
 
@@ -30,11 +28,7 @@ from synapse.api.errors import (
     RequestSendFailed,
     SynapseError,
 )
-from synapse.logging.opentracing import (
-    inject_active_span_byte_dict,
-    trace,
-    trace_servlet,
-)
+from synapse.logging.opentracing import inject_active_span_byte_dict, trace
 from synapse.util.caches.response_cache import ResponseCache
 from synapse.util.stringutils import random_string
 
@@ -98,11 +92,11 @@ class ReplicationEndpoint(object):
         # assert here that sub classes don't try and use the name.
         assert (
             "instance_name" not in self.PATH_ARGS
-        ), "`instance_name` is a reserved paramater name"
+        ), "`instance_name` is a reserved parameter name"
         assert (
             "instance_name"
             not in signature(self.__class__._serialize_payload).parameters
-        ), "`instance_name` is a reserved paramater name"
+        ), "`instance_name` is a reserved parameter name"
 
         assert self.METHOD in ("PUT", "POST", "GET")
 
@@ -141,17 +135,29 @@ class ReplicationEndpoint(object):
         Returns a callable that accepts the same parameters as `_serialize_payload`.
         """
         clock = hs.get_clock()
-        host = hs.config.worker_replication_host
-        port = hs.config.worker_replication_http_port
-
         client = hs.get_simple_http_client()
+        local_instance_name = hs.get_instance_name()
+
+        master_host = hs.config.worker_replication_host
+        master_port = hs.config.worker_replication_http_port
+
+        instance_map = hs.config.worker.instance_map
 
         @trace(opname="outgoing_replication_request")
         @defer.inlineCallbacks
         def send_request(instance_name="master", **kwargs):
-            # Currently we only support sending requests to master process.
-            if instance_name != "master":
-                raise Exception("Unknown instance")
+            if instance_name == local_instance_name:
+                raise Exception("Trying to send HTTP request to self")
+            if instance_name == "master":
+                host = master_host
+                port = master_port
+            elif instance_name in instance_map:
+                host = instance_map[instance_name].host
+                port = instance_map[instance_name].port
+            else:
+                raise Exception(
+                    "Instance %r not in 'instance_map' config" % (instance_name,)
+                )
 
             data = yield cls._serialize_payload(**kwargs)
 
@@ -208,7 +214,7 @@ class ReplicationEndpoint(object):
                 # importantly, not stack traces everywhere)
                 raise e.to_synapse_error()
             except RequestSendFailed as e:
-                raise_from(SynapseError(502, "Failed to talk to master"), e)
+                raise SynapseError(502, "Failed to talk to master") from e
 
             return result
 
@@ -230,11 +236,8 @@ class ReplicationEndpoint(object):
         args = "/".join("(?P<%s>[^/]+)" % (arg,) for arg in url_args)
         pattern = re.compile("^/_synapse/replication/%s/%s$" % (self.NAME, args))
 
-        handler = trace_servlet(self.__class__.__name__, extract_context=True)(handler)
-        # We don't let register paths trace this servlet using the default tracing
-        # options because we wish to extract the context explicitly.
         http_server.register_paths(
-            method, [pattern], handler, self.__class__.__name__, trace=False
+            method, [pattern], handler, self.__class__.__name__,
         )
 
     def _cached_handler(self, request, txn_id, **kwargs):

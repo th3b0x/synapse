@@ -1,3 +1,11 @@
+================
+Synapse |shield|
+================
+
+.. |shield| image:: https://img.shields.io/matrix/synapse:matrix.org?label=support&logo=matrix
+  :alt: (get support on #synapse:matrix.org)
+  :target: https://matrix.to/#/#synapse:matrix.org
+
 .. contents::
 
 Introduction
@@ -75,6 +83,17 @@ at the `Matrix spec <https://matrix.org/docs/spec>`_, and experiment with the
 Thanks for using Matrix!
 
 [1] End-to-end encryption is currently in beta: `blog post <https://matrix.org/blog/2016/11/21/matrixs-olm-end-to-end-encryption-security-assessment-released-and-implemented-cross-platform-on-riot-at-last>`_.
+
+
+Support
+=======
+
+For support installing or managing Synapse, please join |room|_ (from a matrix.org
+account if necessary) and ask questions there. We do not use GitHub issues for
+support requests, only for bug reports and feature requests.
+
+.. |room| replace:: ``#synapse:matrix.org``
+.. _room: https://matrix.to/#/#synapse:matrix.org
 
 
 Synapse Installation
@@ -176,7 +195,7 @@ By default Synapse uses SQLite in and doing so trades performance for convenienc
 SQLite is only recommended in Synapse for testing purposes or for servers with
 light workloads.
 
-Almost all installations should opt to use PostreSQL. Advantages include:
+Almost all installations should opt to use PostgreSQL. Advantages include:
 
 * significant performance improvements due to the superior threading and
   caching model, smarter query optimiser
@@ -196,7 +215,7 @@ Using a reverse proxy with Synapse
 It is recommended to put a reverse proxy such as
 `nginx <https://nginx.org/en/docs/http/ngx_http_proxy_module.html>`_,
 `Apache <https://httpd.apache.org/docs/current/mod/mod_proxy_http.html>`_,
-`Caddy <https://caddyserver.com/docs/proxy>`_ or
+`Caddy <https://caddyserver.com/docs/quick-starts/reverse-proxy>`_ or
 `HAProxy <https://www.haproxy.org/>`_ in front of Synapse. One advantage of
 doing so is that it means that you can expose the default https port (443) to
 Matrix clients without needing to run Synapse with root privileges.
@@ -248,7 +267,7 @@ First calculate the hash of the new password::
     Confirm password:
     $2a$12$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-Then update the `users` table in the database::
+Then update the ``users`` table in the database::
 
     UPDATE users SET password_hash='$2a$12$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
         WHERE name='@test:test.com';
@@ -315,6 +334,9 @@ Building internal API documentation::
 
 Troubleshooting
 ===============
+
+Need help? Join our community support room on Matrix:
+`#synapse:matrix.org <https://matrix.to/#/#synapse:matrix.org>`_
 
 Running out of File Handles
 ---------------------------

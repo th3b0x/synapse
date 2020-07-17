@@ -15,7 +15,7 @@
 
 import logging
 from collections import namedtuple
-from typing import Callable, List
+from typing import Callable, Iterable, List, TypeVar
 
 from prometheus_client import Counter
 
@@ -42,12 +42,14 @@ users_woken_by_stream_counter = Counter(
     "synapse_notifier_users_woken_by_stream", "", ["stream"]
 )
 
+T = TypeVar("T")
+
 
 # TODO(paul): Should be shared somewhere
-def count(func, l):
-    """Return the number of items in l for which func returns true."""
+def count(func: Callable[[T], bool], it: Iterable[T]) -> int:
+    """Return the number of items in it for which func returns true."""
     n = 0
-    for x in l:
+    for x in it:
         if func(x):
             n += 1
     return n
@@ -81,7 +83,7 @@ class _NotifierUserStream(object):
         self.current_token = current_token
 
         # The last token for which we should wake up any streams that have a
-        # token that comes before it. This gets updated everytime we get poked.
+        # token that comes before it. This gets updated every time we get poked.
         # We start it at the current token since if we get any streams
         # that have a token from before we have no idea whether they should be
         # woken up or not, so lets just wake them up.

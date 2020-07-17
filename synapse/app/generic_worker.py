@@ -17,17 +17,15 @@
 import contextlib
 import logging
 import sys
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional, Set
 
 from typing_extensions import ContextManager
 
-from twisted.internet import defer, reactor
-from twisted.web.resource import NoResource
+from twisted.internet import address, reactor
 
 import synapse
 import synapse.events
-from synapse.api.constants import EventTypes
-from synapse.api.errors import HttpResponseException, SynapseError
+from synapse.api.errors import HttpResponseException, RequestSendFailed, SynapseError
 from synapse.api.urls import (
     CLIENT_API_PREFIX,
     FEDERATION_PREFIX,
@@ -39,15 +37,25 @@ from synapse.app import _base
 from synapse.config._base import ConfigError
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.logger import setup_logging
+from synapse.config.server import ListenerConfig
 from synapse.federation import send_queue
 from synapse.federation.transport.server import TransportLayerServer
-from synapse.handlers.presence import BasePresenceHandler, get_interested_parties
-from synapse.http.server import JsonResource
+from synapse.handlers.presence import (
+    BasePresenceHandler,
+    PresenceState,
+    get_interested_parties,
+)
+from synapse.http.server import JsonResource, OptionsResource
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
 from synapse.http.site import SynapseSite
 from synapse.logging.context import LoggingContext
 from synapse.metrics import METRICS_PREFIX, MetricsResource, RegistryProxy
 from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.replication.http import REPLICATION_PREFIX, ReplicationRestResource
+from synapse.replication.http.presence import (
+    ReplicationBumpPresenceActiveTime,
+    ReplicationPresenceSetState,
+)
 from synapse.replication.slave.storage._base import BaseSlavedStore
 from synapse.replication.slave.storage.account_data import SlavedAccountDataStore
 from synapse.replication.slave.storage.appservice import SlavedApplicationServiceStore
@@ -81,11 +89,6 @@ from synapse.replication.tcp.streams import (
     ToDeviceStream,
     TypingStream,
 )
-from synapse.replication.tcp.streams.events import (
-    EventsStream,
-    EventsStreamEventRow,
-    EventsStreamRow,
-)
 from synapse.rest.admin import register_servlets_for_media_repo
 from synapse.rest.client.v1 import events
 from synapse.rest.client.v1.initial_sync import InitialSyncRestServlet
@@ -108,6 +111,7 @@ from synapse.rest.client.v1.room import (
     RoomSendEventRestServlet,
     RoomStateEventRestServlet,
     RoomStateRestServlet,
+    RoomTypingRestServlet,
 )
 from synapse.rest.client.v1.voip import VoipRestServlet
 from synapse.rest.client.v2_alpha import groups, sync, user_directory
@@ -122,11 +126,13 @@ from synapse.rest.client.v2_alpha.register import RegisterRestServlet
 from synapse.rest.client.versions import VersionsRestServlet
 from synapse.rest.key.v2 import KeyApiV2Resource
 from synapse.server import HomeServer
+from synapse.storage.data_stores.main.censor_events import CensorEventsStore
 from synapse.storage.data_stores.main.media_repository import MediaRepositoryStore
 from synapse.storage.data_stores.main.monthly_active_users import (
     MonthlyActiveUsersWorkerStore,
 )
 from synapse.storage.data_stores.main.presence import UserPresenceState
+from synapse.storage.data_stores.main.search import SearchWorkerStore
 from synapse.storage.data_stores.main.ui_auth import UIAuthWorkerStore
 from synapse.storage.data_stores.main.user_directory import UserDirectoryStore
 from synapse.types import ReadReceipt
@@ -140,31 +146,18 @@ logger = logging.getLogger("synapse.app.generic_worker")
 
 class PresenceStatusStubServlet(RestServlet):
     """If presence is disabled this servlet can be used to stub out setting
-    presence status, while proxying the getters to the master instance.
+    presence status.
     """
 
     PATTERNS = client_patterns("/presence/(?P<user_id>[^/]*)/status")
 
     def __init__(self, hs):
         super(PresenceStatusStubServlet, self).__init__()
-        self.http_client = hs.get_simple_http_client()
         self.auth = hs.get_auth()
-        self.main_uri = hs.config.worker_main_http_uri
 
     async def on_GET(self, request, user_id):
-        # Pass through the auth headers, if any, in case the access token
-        # is there.
-        auth_headers = request.requestHeaders.getRawHeaders("Authorization", [])
-        headers = {"Authorization": auth_headers}
-
-        try:
-            result = await self.http_client.get_json(
-                self.main_uri + request.uri.decode("ascii"), headers=headers
-            )
-        except HttpResponseException as e:
-            raise e.to_synapse_error()
-
-        return 200, result
+        await self.auth.get_user_by_req(request)
+        return 200, {"presence": "offline"}
 
     async def on_PUT(self, request, user_id):
         await self.auth.get_user_by_req(request)
@@ -214,13 +207,38 @@ class KeyUploadServlet(RestServlet):
 
         if body:
             # They're actually trying to upload something, proxy to main synapse.
-            # Pass through the auth headers, if any, in case the access token
-            # is there.
-            auth_headers = request.requestHeaders.getRawHeaders(b"Authorization", [])
-            headers = {"Authorization": auth_headers}
-            result = await self.http_client.post_json_get_json(
-                self.main_uri + request.uri.decode("ascii"), body, headers=headers
+
+            # Proxy headers from the original request, such as the auth headers
+            # (in case the access token is there) and the original IP /
+            # User-Agent of the request.
+            headers = {
+                header: request.requestHeaders.getRawHeaders(header, [])
+                for header in (b"Authorization", b"User-Agent")
+            }
+            # Add the previous hop the the X-Forwarded-For header.
+            x_forwarded_for = request.requestHeaders.getRawHeaders(
+                b"X-Forwarded-For", []
             )
+            if isinstance(request.client, (address.IPv4Address, address.IPv6Address)):
+                previous_host = request.client.host.encode("ascii")
+                # If the header exists, add to the comma-separated list of the first
+                # instance of the header. Otherwise, generate a new header.
+                if x_forwarded_for:
+                    x_forwarded_for = [
+                        x_forwarded_for[0] + b", " + previous_host
+                    ] + x_forwarded_for[1:]
+                else:
+                    x_forwarded_for = [previous_host]
+            headers[b"X-Forwarded-For"] = x_forwarded_for
+
+            try:
+                result = await self.http_client.post_json_get_json(
+                    self.main_uri + request.uri.decode("ascii"), body, headers=headers
+                )
+            except HttpResponseException as e:
+                raise e.to_synapse_error() from e
+            except RequestSendFailed as e:
+                raise SynapseError(502, "Failed to talk to master") from e
 
             return 200, result
         else:
@@ -258,6 +276,9 @@ class GenericWorkerPresence(BasePresenceHandler):
         # user_id -> last_sync_ms. Lists the users that have stopped syncing
         # but we haven't notified the master of that yet
         self.users_going_offline = {}
+
+        self._bump_active_client = ReplicationBumpPresenceActiveTime.make_client(hs)
+        self._set_state_client = ReplicationPresenceSetState.make_client(hs)
 
         self._send_stop_syncing_loop = self.clock.looping_call(
             self.send_stop_syncing, UPDATE_SYNCING_USERS_MS
@@ -316,10 +337,6 @@ class GenericWorkerPresence(BasePresenceHandler):
                 self.users_going_offline.pop(user_id, None)
                 self.send_user_sync(user_id, False, last_sync_ms)
 
-    def set_state(self, user, state, ignore_status_msg=False):
-        # TODO Hows this supposed to work?
-        return defer.succeed(None)
-
     async def user_syncing(
         self, user_id: str, affect_presence: bool
     ) -> ContextManager[None]:
@@ -358,9 +375,8 @@ class GenericWorkerPresence(BasePresenceHandler):
 
         return _user_syncing()
 
-    @defer.inlineCallbacks
-    def notify_from_replication(self, states, stream_id):
-        parties = yield get_interested_parties(self.store, states)
+    async def notify_from_replication(self, states, stream_id):
+        parties = await get_interested_parties(self.store, states)
         room_ids_to_states, users_to_states = parties
 
         self.notifier.on_new_event(
@@ -370,8 +386,7 @@ class GenericWorkerPresence(BasePresenceHandler):
             users=users_to_states.keys(),
         )
 
-    @defer.inlineCallbacks
-    def process_replication_rows(self, token, rows):
+    async def process_replication_rows(self, token, rows):
         states = [
             UserPresenceState(
                 row.user_id,
@@ -389,7 +404,7 @@ class GenericWorkerPresence(BasePresenceHandler):
             self.user_to_current_state[state.user_id] = state
 
         stream_id = token
-        yield self.notify_from_replication(states, stream_id)
+        await self.notify_from_replication(states, stream_id)
 
     def get_currently_syncing_users_for_replication(self) -> Iterable[str]:
         return [
@@ -398,36 +413,41 @@ class GenericWorkerPresence(BasePresenceHandler):
             if count > 0
         ]
 
-
-class GenericWorkerTyping(object):
-    def __init__(self, hs):
-        self._latest_room_serial = 0
-        self._reset()
-
-    def _reset(self):
+    async def set_state(self, target_user, state, ignore_status_msg=False):
+        """Set the presence state of the user.
         """
-        Reset the typing handler's data caches.
+        presence = state["presence"]
+
+        valid_presence = (
+            PresenceState.ONLINE,
+            PresenceState.UNAVAILABLE,
+            PresenceState.OFFLINE,
+        )
+        if presence not in valid_presence:
+            raise SynapseError(400, "Invalid presence state")
+
+        user_id = target_user.to_string()
+
+        # If presence is disabled, no-op
+        if not self.hs.config.use_presence:
+            return
+
+        # Proxy request to master
+        await self._set_state_client(
+            user_id=user_id, state=state, ignore_status_msg=ignore_status_msg
+        )
+
+    async def bump_presence_active_time(self, user):
+        """We've seen the user do something that indicates they're interacting
+        with the app.
         """
-        # map room IDs to serial numbers
-        self._room_serials = {}
-        # map room IDs to sets of users currently typing
-        self._room_typing = {}
+        # If presence is disabled, no-op
+        if not self.hs.config.use_presence:
+            return
 
-    def process_replication_rows(self, token, rows):
-        if self._latest_room_serial > token:
-            # The master has gone backwards. To prevent inconsistent data, just
-            # clear everything.
-            self._reset()
-
-        # Set the latest serial token to whatever the server gave us.
-        self._latest_room_serial = token
-
-        for row in rows:
-            self._room_serials[row.room_id] = token
-            self._room_typing[row.room_id] = row.user_ids
-
-    def get_current_token(self) -> int:
-        return self._latest_room_serial
+        # Proxy request to master
+        user_id = user.to_string()
+        await self._bump_active_client(user_id=user_id)
 
 
 class GenericWorkerSlavedStore(
@@ -442,6 +462,7 @@ class GenericWorkerSlavedStore(
     SlavedGroupServerStore,
     SlavedAccountDataStore,
     SlavedPusherStore,
+    CensorEventsStore,
     SlavedEventStore,
     SlavedKeyStore,
     RoomStore,
@@ -455,39 +476,27 @@ class GenericWorkerSlavedStore(
     SlavedFilteringStore,
     MonthlyActiveUsersWorkerStore,
     MediaRepositoryStore,
+    SearchWorkerStore,
     BaseSlavedStore,
 ):
-    def __init__(self, database, db_conn, hs):
-        super(GenericWorkerSlavedStore, self).__init__(database, db_conn, hs)
-
-        # We pull out the current federation stream position now so that we
-        # always have a known value for the federation position in memory so
-        # that we don't have to bounce via a deferred once when we start the
-        # replication streams.
-        self.federation_out_pos_startup = self._get_federation_out_pos(db_conn)
-
-    def _get_federation_out_pos(self, db_conn):
-        sql = "SELECT stream_id FROM federation_stream_position WHERE type = ?"
-        sql = self.database_engine.convert_param_style(sql)
-
-        txn = db_conn.cursor()
-        txn.execute(sql, ("federation",))
-        rows = txn.fetchall()
-        txn.close()
-
-        return rows[0][0] if rows else -1
+    pass
 
 
 class GenericWorkerServer(HomeServer):
     DATASTORE_CLASS = GenericWorkerSlavedStore
 
-    def _listen_http(self, listener_config):
-        port = listener_config["port"]
-        bind_addresses = listener_config["bind_addresses"]
-        site_tag = listener_config.get("tag", port)
+    def _listen_http(self, listener_config: ListenerConfig):
+        port = listener_config.port
+        bind_addresses = listener_config.bind_addresses
+
+        assert listener_config.http_options is not None
+
+        site_tag = listener_config.http_options.tag
+        if site_tag is None:
+            site_tag = port
         resources = {}
-        for res in listener_config["resources"]:
-            for name in res["names"]:
+        for res in listener_config.http_options.resources:
+            for name in res.names:
                 if name == "metrics":
                     resources[METRICS_PREFIX] = MetricsResource(RegistryProxy)
                 elif name == "client":
@@ -517,6 +526,7 @@ class GenericWorkerServer(HomeServer):
                     KeyUploadServlet(self).register(resource)
                     AccountDataServlet(self).register(resource)
                     RoomAccountDataServlet(self).register(resource)
+                    RoomTypingRestServlet(self).register(resource)
 
                     sync.register_servlets(self, resource)
                     events.register_servlets(self, resource)
@@ -557,7 +567,7 @@ class GenericWorkerServer(HomeServer):
                             " repository is disabled. Ignoring."
                         )
 
-                if name == "openid" and "federation" not in res["names"]:
+                if name == "openid" and "federation" not in res.names:
                     # Only load the openid resource separately if federation resource
                     # is not specified since federation resource includes openid
                     # resource.
@@ -572,7 +582,10 @@ class GenericWorkerServer(HomeServer):
                 if name in ["keys", "federation"]:
                     resources[SERVER_KEY_V2_PREFIX] = KeyApiV2Resource(self)
 
-        root_resource = create_resource_tree(resources, NoResource())
+                if name == "replication":
+                    resources[REPLICATION_PREFIX] = ReplicationRestResource(self)
+
+        root_resource = create_resource_tree(resources, OptionsResource())
 
         _base.listen_tcp(
             bind_addresses,
@@ -589,19 +602,19 @@ class GenericWorkerServer(HomeServer):
 
         logger.info("Synapse worker now listening on port %d", port)
 
-    def start_listening(self, listeners):
+    def start_listening(self, listeners: Iterable[ListenerConfig]):
         for listener in listeners:
-            if listener["type"] == "http":
+            if listener.type == "http":
                 self._listen_http(listener)
-            elif listener["type"] == "manhole":
+            elif listener.type == "manhole":
                 _base.listen_tcp(
-                    listener["bind_addresses"],
-                    listener["port"],
+                    listener.bind_addresses,
+                    listener.port,
                     manhole(
                         username="matrix", password="rabbithole", globals={"hs": self}
                     ),
                 )
-            elif listener["type"] == "metrics":
+            elif listener.type == "metrics":
                 if not self.get_config().enable_metrics:
                     logger.warning(
                         (
@@ -610,9 +623,9 @@ class GenericWorkerServer(HomeServer):
                         )
                     )
                 else:
-                    _base.listen_metrics(listener["bind_addresses"], listener["port"])
+                    _base.listen_metrics(listener.bind_addresses, listener.port)
             else:
-                logger.warning("Unrecognized listener type: %s", listener["type"])
+                logger.warning("Unsupported listener type: %s", listener.type)
 
         self.get_tcp_replication().start_replication(self)
 
@@ -625,13 +638,10 @@ class GenericWorkerServer(HomeServer):
     def build_presence_handler(self):
         return GenericWorkerPresence(self)
 
-    def build_typing_handler(self):
-        return GenericWorkerTyping(self)
-
 
 class GenericWorkerReplicationHandler(ReplicationDataHandler):
     def __init__(self, hs):
-        super(GenericWorkerReplicationHandler, self).__init__(hs.get_datastore())
+        super(GenericWorkerReplicationHandler, self).__init__(hs)
 
         self.store = hs.get_datastore()
         self.typing_handler = hs.get_typing_handler()
@@ -641,10 +651,9 @@ class GenericWorkerReplicationHandler(ReplicationDataHandler):
         self.notify_pushers = hs.config.start_pushers
         self.pusher_pool = hs.get_pusherpool()
 
+        self.send_handler = None  # type: Optional[FederationSenderHandler]
         if hs.config.send_federation:
-            self.send_handler = FederationSenderHandler(hs, self)
-        else:
-            self.send_handler = None
+            self.send_handler = FederationSenderHandler(hs)
 
     async def on_rdata(self, stream_name, instance_name, token, rows):
         await super().on_rdata(stream_name, instance_name, token, rows)
@@ -657,30 +666,7 @@ class GenericWorkerReplicationHandler(ReplicationDataHandler):
                     stream_name, token, rows
                 )
 
-            if stream_name == EventsStream.NAME:
-                # We shouldn't get multiple rows per token for events stream, so
-                # we don't need to optimise this for multiple rows.
-                for row in rows:
-                    if row.type != EventsStreamEventRow.TypeId:
-                        continue
-                    assert isinstance(row, EventsStreamRow)
-
-                    event = await self.store.get_event(
-                        row.data.event_id, allow_rejected=True
-                    )
-                    if event.rejected_reason:
-                        continue
-
-                    extra_users = ()
-                    if event.type == EventTypes.Member:
-                        extra_users = (event.state_key,)
-                    max_token = self.store.get_room_max_stream_ordering()
-                    self.notifier.on_new_room_event(
-                        event, token, max_token, extra_users
-                    )
-
-                await self.pusher_pool.on_new_notifications(token, token)
-            elif stream_name == PushRulesStream.NAME:
+            if stream_name == PushRulesStream.NAME:
                 self.notifier.on_new_event(
                     "push_rules_key", token, users=[row.user_id for row in rows]
                 )
@@ -705,7 +691,7 @@ class GenericWorkerReplicationHandler(ReplicationDataHandler):
                 if entities:
                     self.notifier.on_new_event("to_device_key", token, users=entities)
             elif stream_name == DeviceListsStream.NAME:
-                all_room_ids = set()
+                all_room_ids = set()  # type: Set[str]
                 for row in rows:
                     if row.entity.startswith("@"):
                         room_ids = await self.store.get_rooms_for_user(row.entity)
@@ -725,6 +711,11 @@ class GenericWorkerReplicationHandler(ReplicationDataHandler):
                         await self.start_pusher(row.user_id, row.app_id, row.pushkey)
         except Exception:
             logger.exception("Error processing replication")
+
+    async def on_position(self, stream_name: str, instance_name: str, token: int):
+        await super().on_position(stream_name, instance_name, token)
+        # Also call on_rdata to ensure that stream positions are properly reset.
+        await self.on_rdata(stream_name, instance_name, token, [])
 
     def stop_pusher(self, user_id, app_id, pushkey):
         if not self.notify_pushers:
@@ -756,23 +747,24 @@ class GenericWorkerReplicationHandler(ReplicationDataHandler):
 
 
 class FederationSenderHandler(object):
-    """Processes the replication stream and forwards the appropriate entries
-    to the federation sender.
+    """Processes the fedration replication stream
+
+    This class is only instantiate on the worker responsible for sending outbound
+    federation transactions. It receives rows from the replication stream and forwards
+    the appropriate entries to the FederationSender class.
     """
 
-    def __init__(self, hs: GenericWorkerServer, replication_client):
+    def __init__(self, hs: GenericWorkerServer):
         self.store = hs.get_datastore()
         self._is_mine_id = hs.is_mine_id
         self.federation_sender = hs.get_federation_sender()
-        self.replication_client = replication_client
+        self._hs = hs
 
-        self.federation_position = self.store.federation_out_pos_startup
+        # Stores the latest position in the federation stream we've gotten up
+        # to. This is always set before we use it.
+        self.federation_position = None
+
         self._fed_position_linearizer = Linearizer(name="_fed_position_linearizer")
-
-        self._last_ack = self.federation_position
-
-        self._room_serials = {}
-        self._room_typing = {}
 
     def on_start(self):
         # There may be some events that are persisted but haven't been sent,
@@ -836,22 +828,50 @@ class FederationSenderHandler(object):
             await self.federation_sender.send_read_receipt(receipt_info)
 
     async def update_token(self, token):
+        """Update the record of where we have processed to in the federation stream.
+
+        Called after we have processed a an update received over replication. Sends
+        a FEDERATION_ACK back to the master, and stores the token that we have processed
+         in `federation_stream_position` so that we can restart where we left off.
+        """
+        self.federation_position = token
+
+        # We save and send the ACK to master asynchronously, so we don't block
+        # processing on persistence. We don't need to do this operation for
+        # every single RDATA we receive, we just need to do it periodically.
+
+        if self._fed_position_linearizer.is_queued(None):
+            # There is already a task queued up to save and send the token, so
+            # no need to queue up another task.
+            return
+
+        run_as_background_process("_save_and_send_ack", self._save_and_send_ack)
+
+    async def _save_and_send_ack(self):
+        """Save the current federation position in the database and send an ACK
+        to master with where we're up to.
+        """
         try:
-            self.federation_position = token
-
             # We linearize here to ensure we don't have races updating the token
-            with (await self._fed_position_linearizer.queue(None)):
-                if self._last_ack < self.federation_position:
-                    await self.store.update_federation_out_pos(
-                        "federation", self.federation_position
-                    )
+            #
+            # XXX this appears to be redundant, since the ReplicationCommandHandler
+            # has a linearizer which ensures that we only process one line of
+            # replication data at a time. Should we remove it, or is it doing useful
+            # service for robustness? Or could we replace it with an assertion that
+            # we're not being re-entered?
 
-                    # We ACK this token over replication so that the master can drop
-                    # its in memory queues
-                    self.replication_client.send_federation_ack(
-                        self.federation_position
-                    )
-                    self._last_ack = self.federation_position
+            with (await self._fed_position_linearizer.queue(None)):
+                # We persist and ack the same position, so we take a copy of it
+                # here as otherwise it can get modified from underneath us.
+                current_position = self.federation_position
+
+                await self.store.update_federation_out_pos(
+                    "federation", current_position
+                )
+
+                # We ACK this token over replication so that the master can drop
+                # its in memory queues
+                self._hs.get_tcp_replication().send_federation_ack(current_position)
         except Exception:
             logger.exception("Error updating federation stream position")
 
@@ -879,7 +899,7 @@ def start(config_options):
     )
 
     if config.worker_app == "synapse.app.appservice":
-        if config.notify_appservices:
+        if config.appservice.notify_appservices:
             sys.stderr.write(
                 "\nThe appservices must be disabled in the main synapse process"
                 "\nbefore they can be run in a separate worker."
@@ -889,13 +909,13 @@ def start(config_options):
             sys.exit(1)
 
         # Force the appservice to start since they will be disabled in the main config
-        config.notify_appservices = True
+        config.appservice.notify_appservices = True
     else:
         # For other worker types we force this to off.
-        config.notify_appservices = False
+        config.appservice.notify_appservices = False
 
     if config.worker_app == "synapse.app.pusher":
-        if config.start_pushers:
+        if config.server.start_pushers:
             sys.stderr.write(
                 "\nThe pushers must be disabled in the main synapse process"
                 "\nbefore they can be run in a separate worker."
@@ -905,13 +925,13 @@ def start(config_options):
             sys.exit(1)
 
         # Force the pushers to start since they will be disabled in the main config
-        config.start_pushers = True
+        config.server.start_pushers = True
     else:
         # For other worker types we force this to off.
-        config.start_pushers = False
+        config.server.start_pushers = False
 
     if config.worker_app == "synapse.app.user_dir":
-        if config.update_user_directory:
+        if config.server.update_user_directory:
             sys.stderr.write(
                 "\nThe update_user_directory must be disabled in the main synapse process"
                 "\nbefore they can be run in a separate worker."
@@ -921,13 +941,13 @@ def start(config_options):
             sys.exit(1)
 
         # Force the pushers to start since they will be disabled in the main config
-        config.update_user_directory = True
+        config.server.update_user_directory = True
     else:
         # For other worker types we force this to off.
-        config.update_user_directory = False
+        config.server.update_user_directory = False
 
     if config.worker_app == "synapse.app.federation_sender":
-        if config.send_federation:
+        if config.federation.send_federation:
             sys.stderr.write(
                 "\nThe send_federation must be disabled in the main synapse process"
                 "\nbefore they can be run in a separate worker."
@@ -937,10 +957,10 @@ def start(config_options):
             sys.exit(1)
 
         # Force the pushers to start since they will be disabled in the main config
-        config.send_federation = True
+        config.federation.send_federation = True
     else:
         # For other worker types we force this to off.
-        config.send_federation = False
+        config.federation.send_federation = False
 
     synapse.events.USE_FROZEN_DICTS = config.use_frozen_dicts
 

@@ -14,8 +14,7 @@
 
 import logging
 import re
-
-from six import StringIO
+from io import StringIO
 
 from twisted.internet.defer import Deferred
 from twisted.python.failure import Failure
@@ -24,11 +23,8 @@ from twisted.web.resource import Resource
 from twisted.web.server import NOT_DONE_YET
 
 from synapse.api.errors import Codes, RedirectException, SynapseError
-from synapse.http.server import (
-    DirectServeResource,
-    JsonResource,
-    wrap_html_request_handler,
-)
+from synapse.config.server import parse_listener_def
+from synapse.http.server import DirectServeHtmlResource, JsonResource, OptionsResource
 from synapse.http.site import SynapseSite, logger
 from synapse.logging.context import make_deferred_yieldable
 from synapse.util import Clock
@@ -168,13 +164,98 @@ class JsonResourceTests(unittest.TestCase):
         self.assertEqual(channel.json_body["errcode"], "M_UNRECOGNIZED")
 
 
+class OptionsResourceTests(unittest.TestCase):
+    def setUp(self):
+        self.reactor = ThreadedMemoryReactorClock()
+
+        class DummyResource(Resource):
+            isLeaf = True
+
+            def render(self, request):
+                return request.path
+
+        # Setup a resource with some children.
+        self.resource = OptionsResource()
+        self.resource.putChild(b"res", DummyResource())
+
+    def _make_request(self, method, path):
+        """Create a request from the method/path and return a channel with the response."""
+        request, channel = make_request(self.reactor, method, path, shorthand=False)
+        request.prepath = []  # This doesn't get set properly by make_request.
+
+        # Create a site and query for the resource.
+        site = SynapseSite(
+            "test",
+            "site_tag",
+            parse_listener_def({"type": "http", "port": 0}),
+            self.resource,
+            "1.0",
+        )
+        request.site = site
+        resource = site.getResourceFor(request)
+
+        # Finally, render the resource and return the channel.
+        render(request, resource, self.reactor)
+        return channel
+
+    def test_unknown_options_request(self):
+        """An OPTIONS requests to an unknown URL still returns 200 OK."""
+        channel = self._make_request(b"OPTIONS", b"/foo/")
+        self.assertEqual(channel.result["code"], b"200")
+        self.assertEqual(channel.result["body"], b"{}")
+
+        # Ensure the correct CORS headers have been added
+        self.assertTrue(
+            channel.headers.hasHeader(b"Access-Control-Allow-Origin"),
+            "has CORS Origin header",
+        )
+        self.assertTrue(
+            channel.headers.hasHeader(b"Access-Control-Allow-Methods"),
+            "has CORS Methods header",
+        )
+        self.assertTrue(
+            channel.headers.hasHeader(b"Access-Control-Allow-Headers"),
+            "has CORS Headers header",
+        )
+
+    def test_known_options_request(self):
+        """An OPTIONS requests to an known URL still returns 200 OK."""
+        channel = self._make_request(b"OPTIONS", b"/res/")
+        self.assertEqual(channel.result["code"], b"200")
+        self.assertEqual(channel.result["body"], b"{}")
+
+        # Ensure the correct CORS headers have been added
+        self.assertTrue(
+            channel.headers.hasHeader(b"Access-Control-Allow-Origin"),
+            "has CORS Origin header",
+        )
+        self.assertTrue(
+            channel.headers.hasHeader(b"Access-Control-Allow-Methods"),
+            "has CORS Methods header",
+        )
+        self.assertTrue(
+            channel.headers.hasHeader(b"Access-Control-Allow-Headers"),
+            "has CORS Headers header",
+        )
+
+    def test_unknown_request(self):
+        """A non-OPTIONS request to an unknown URL should 404."""
+        channel = self._make_request(b"GET", b"/foo/")
+        self.assertEqual(channel.result["code"], b"404")
+
+    def test_known_request(self):
+        """A non-OPTIONS request to an known URL should query the proper resource."""
+        channel = self._make_request(b"GET", b"/res/")
+        self.assertEqual(channel.result["code"], b"200")
+        self.assertEqual(channel.result["body"], b"/res/")
+
+
 class WrapHtmlRequestHandlerTests(unittest.TestCase):
-    class TestResource(DirectServeResource):
+    class TestResource(DirectServeHtmlResource):
         callback = None
 
-        @wrap_html_request_handler
         async def _async_render_GET(self, request):
-            return await self.callback(request)
+            await self.callback(request)
 
     def setUp(self):
         self.reactor = ThreadedMemoryReactorClock()
@@ -267,7 +348,9 @@ class SiteTestCase(unittest.HomeserverTestCase):
         # time out the request while it's 'processing'
         base_resource = Resource()
         base_resource.putChild(b"", HangingResource())
-        site = SynapseSite("test", "site_tag", {}, base_resource, "1.0")
+        site = SynapseSite(
+            "test", "site_tag", self.hs.config.listeners[0], base_resource, "1.0"
+        )
 
         server = site.buildProtocol(None)
         client = AccumulatingProtocol()

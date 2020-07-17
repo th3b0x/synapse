@@ -21,6 +21,7 @@ from typing import Dict, Set, Tuple
 from typing_extensions import Deque
 
 from synapse.storage.database import Database, LoggingTransaction
+from synapse.storage.util.sequence import PostgresSequenceGenerator
 
 
 class IdGenerator(object):
@@ -166,6 +167,7 @@ class ChainedIdGenerator(object):
 
     def __init__(self, chained_generator, db_conn, table, column):
         self.chained_generator = chained_generator
+        self._table = table
         self._lock = threading.Lock()
         self._current_max = _load_current_id(db_conn, table, column)
         self._unfinished_ids = deque()  # type: Deque[Tuple[int, int]]
@@ -204,6 +206,16 @@ class ChainedIdGenerator(object):
 
             return self._current_max, self.chained_generator.get_current_token()
 
+    def advance(self, token: int):
+        """Stub implementation for advancing the token when receiving updates
+        over replication; raises an exception as this instance should be the
+        only source of updates.
+        """
+
+        raise Exception(
+            "Attempted to advance token on source for table %r", self._table
+        )
+
 
 class MultiWriterIdGenerator:
     """An ID generator that tracks a stream that can have multiple writers.
@@ -236,7 +248,6 @@ class MultiWriterIdGenerator:
     ):
         self._db = db
         self._instance_name = instance_name
-        self._sequence_name = sequence_name
 
         # We lock as some functions may be called from DB threads.
         self._lock = threading.Lock()
@@ -248,6 +259,8 @@ class MultiWriterIdGenerator:
         # Set of local IDs that we're still processing. The current position
         # should be less than the minimum of this set (if not empty).
         self._unfinished_ids = set()  # type: Set[int]
+
+        self._sequence_gen = PostgresSequenceGenerator(sequence_name)
 
     def _load_current_ids(
         self, db_conn, table: str, instance_column: str, id_column: str
@@ -272,9 +285,7 @@ class MultiWriterIdGenerator:
         return current_positions
 
     def _load_next_id_txn(self, txn):
-        txn.execute("SELECT nextval(?)", (self._sequence_name,))
-        (next_id,) = txn.fetchone()
-        return next_id
+        return self._sequence_gen.get_next_id_txn(txn)
 
     async def get_next(self):
         """

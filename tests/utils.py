@@ -21,9 +21,9 @@ import time
 import uuid
 import warnings
 from inspect import getcallargs
+from urllib import parse as urlparse
 
 from mock import Mock, patch
-from six.moves.urllib import parse as urlparse
 
 from twisted.internet import defer, reactor
 
@@ -167,6 +167,8 @@ def default_config(name, parse=False):
         # disable user directory updates, because they get done in the
         # background, which upsets the test runner.
         "update_user_directory": False,
+        "caches": {"global_factor": 1},
+        "listeners": [{"port": 0, "type": "http"}],
     }
 
     if parse:

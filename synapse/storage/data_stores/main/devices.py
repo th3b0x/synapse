@@ -15,9 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from typing import List, Tuple
-
-from six import iteritems
+from typing import List, Optional, Set, Tuple
 
 from canonicaljson import json
 
@@ -54,10 +52,6 @@ DROP_DEVICE_LIST_STREAMS_NON_UNIQUE_INDEXES = (
 )
 
 BG_UPDATE_REMOVE_DUP_OUTBOUND_POKES = "remove_dup_outbound_pokes"
-
-BG_UPDATE_DROP_DEVICE_LISTS_OUTBOUND_LAST_SUCCESS_NON_UNIQUE_IDX = (
-    "drop_device_lists_outbound_last_success_non_unique_idx"
-)
 
 
 class DeviceWorkerStore(SQLBaseStore):
@@ -212,7 +206,7 @@ class DeviceWorkerStore(SQLBaseStore):
         )
 
         # add the updated cross-signing keys to the results list
-        for user_id, result in iteritems(cross_signing_keys_by_user):
+        for user_id, result in cross_signing_keys_by_user.items():
             result["user_id"] = user_id
             # FIXME: switch to m.signing_key_update when MSC1756 is merged into the spec
             results.append(("org.matrix.signing_key_update", result))
@@ -273,7 +267,7 @@ class DeviceWorkerStore(SQLBaseStore):
         )
 
         results = []
-        for user_id, user_devices in iteritems(devices):
+        for user_id, user_devices in devices.items():
             # The prev_id for the first row is always the last row before
             # `from_stream_id`
             prev_id = yield self._get_last_device_update_for_remote_user(
@@ -497,7 +491,7 @@ class DeviceWorkerStore(SQLBaseStore):
         if devices:
             user_devices = devices[user_id]
             results = []
-            for device_id, device in iteritems(user_devices):
+            for device_id, device in user_devices.items():
                 result = {"device_id": device_id}
 
                 key_json = device.get("key_json", None)
@@ -583,37 +577,63 @@ class DeviceWorkerStore(SQLBaseStore):
             rows = yield self.db.execute(
                 "get_users_whose_signatures_changed", None, sql, user_id, from_key
             )
-            return {user for row in rows for user in json.loads(row[0])}
+            return {user for row in rows for user in db_to_json(row[0])}
         else:
             return set()
 
     async def get_all_device_list_changes_for_remotes(
-        self, from_key: int, to_key: int, limit: int,
-    ) -> List[Tuple[int, str]]:
-        """Return a list of `(stream_id, entity)` which is the combined list of
-        changes to devices and which destinations need to be poked. Entity is
-        either a user ID (starting with '@') or a remote destination.
+        self, instance_name: str, last_id: int, current_id: int, limit: int
+    ) -> Tuple[List[Tuple[int, tuple]], int, bool]:
+        """Get updates for device lists replication stream.
+
+        Args:
+            instance_name: The writer we want to fetch updates from. Unused
+                here since there is only ever one writer.
+            last_id: The token to fetch updates from. Exclusive.
+            current_id: The token to fetch updates up to. Inclusive.
+            limit: The requested limit for the number of rows to return. The
+                function may return more or fewer rows.
+
+        Returns:
+            A tuple consisting of: the updates, a token to use to fetch
+            subsequent updates, and whether we returned fewer rows than exists
+            between the requested tokens due to the limit.
+
+            The token returned can be used in a subsequent call to this
+            function to get further updatees.
+
+            The updates are a list of 2-tuples of stream ID and the row data
         """
 
-        # This query Does The Right Thing where it'll correctly apply the
-        # bounds to the inner queries.
-        sql = """
-            SELECT stream_id, entity FROM (
-                SELECT stream_id, user_id AS entity FROM device_lists_stream
-                UNION ALL
-                SELECT stream_id, destination AS entity FROM device_lists_outbound_pokes
-            ) AS e
-            WHERE ? < stream_id AND stream_id <= ?
-            LIMIT ?
-        """
+        if last_id == current_id:
+            return [], current_id, False
 
-        return await self.db.execute(
+        def _get_all_device_list_changes_for_remotes(txn):
+            # This query Does The Right Thing where it'll correctly apply the
+            # bounds to the inner queries.
+            sql = """
+                SELECT stream_id, entity FROM (
+                    SELECT stream_id, user_id AS entity FROM device_lists_stream
+                    UNION ALL
+                    SELECT stream_id, destination AS entity FROM device_lists_outbound_pokes
+                ) AS e
+                WHERE ? < stream_id AND stream_id <= ?
+                LIMIT ?
+            """
+
+            txn.execute(sql, (last_id, current_id, limit))
+            updates = [(row[0], row[1:]) for row in txn]
+            limited = False
+            upto_token = current_id
+            if len(updates) >= limit:
+                upto_token = updates[-1][0]
+                limited = True
+
+            return updates, upto_token, limited
+
+        return await self.db.runInteraction(
             "get_all_device_list_changes_for_remotes",
-            None,
-            sql,
-            from_key,
-            to_key,
-            limit,
+            _get_all_device_list_changes_for_remotes,
         )
 
     @cached(max_entries=10000)
@@ -649,21 +669,31 @@ class DeviceWorkerStore(SQLBaseStore):
         return results
 
     @defer.inlineCallbacks
-    def get_user_ids_requiring_device_list_resync(self, user_ids: Collection[str]):
+    def get_user_ids_requiring_device_list_resync(
+        self, user_ids: Optional[Collection[str]] = None,
+    ) -> Set[str]:
         """Given a list of remote users return the list of users that we
-        should resync the device lists for.
+        should resync the device lists for. If None is given instead of a list,
+        return every user that we should resync the device lists for.
 
         Returns:
-            Deferred[Set[str]]
+            The IDs of users whose device lists need resync.
         """
-
-        rows = yield self.db.simple_select_many_batch(
-            table="device_lists_remote_resync",
-            column="user_id",
-            iterable=user_ids,
-            retcols=("user_id",),
-            desc="get_user_ids_requiring_device_list_resync",
-        )
+        if user_ids:
+            rows = yield self.db.simple_select_many_batch(
+                table="device_lists_remote_resync",
+                column="user_id",
+                iterable=user_ids,
+                retcols=("user_id",),
+                desc="get_user_ids_requiring_device_list_resync_with_iterable",
+            )
+        else:
+            rows = yield self.db.simple_select_list(
+                table="device_lists_remote_resync",
+                keyvalues=None,
+                retcols=("user_id",),
+                desc="get_user_ids_requiring_device_list_resync",
+            )
 
         return {row["user_id"] for row in rows}
 
@@ -677,6 +707,25 @@ class DeviceWorkerStore(SQLBaseStore):
             values={},
             insertion_values={"added_ts": self._clock.time_msec()},
             desc="make_remote_user_device_cache_as_stale",
+        )
+
+    def mark_remote_user_device_list_as_unsubscribed(self, user_id):
+        """Mark that we no longer track device lists for remote user.
+        """
+
+        def _mark_remote_user_device_list_as_unsubscribed_txn(txn):
+            self.db.simple_delete_txn(
+                txn,
+                table="device_lists_remote_extremeties",
+                keyvalues={"user_id": user_id},
+            )
+            self._invalidate_cache_and_stream(
+                txn, self.get_device_list_last_stream_id_for_remote, (user_id,)
+            )
+
+        return self.db.runInteraction(
+            "mark_remote_user_device_list_as_unsubscribed",
+            _mark_remote_user_device_list_as_unsubscribed_txn,
         )
 
 
@@ -720,19 +769,13 @@ class DeviceBackgroundUpdateStore(SQLBaseStore):
             BG_UPDATE_REMOVE_DUP_OUTBOUND_POKES, self._remove_duplicate_outbound_pokes,
         )
 
-        # create a unique index on device_lists_outbound_last_success
-        self.db.updates.register_background_index_update(
+        # a pair of background updates that were added during the 1.14 release cycle,
+        # but replaced with 58/06dlols_unique_idx.py
+        self.db.updates.register_noop_background_update(
             "device_lists_outbound_last_success_unique_idx",
-            index_name="device_lists_outbound_last_success_unique_idx",
-            table="device_lists_outbound_last_success",
-            columns=["destination", "user_id"],
-            unique=True,
         )
-
-        # once that completes, we can remove the old non-unique index.
-        self.db.updates.register_background_update_handler(
-            BG_UPDATE_DROP_DEVICE_LISTS_OUTBOUND_LAST_SUCCESS_NON_UNIQUE_IDX,
-            self._drop_device_lists_outbound_last_success_non_unique_idx,
+        self.db.updates.register_noop_background_update(
+            "drop_device_lists_outbound_last_success_non_unique_idx",
         )
 
     @defer.inlineCallbacks
@@ -808,20 +851,6 @@ class DeviceBackgroundUpdateStore(SQLBaseStore):
             )
 
         return rows
-
-    async def _drop_device_lists_outbound_last_success_non_unique_idx(
-        self, progress, batch_size
-    ):
-        def f(txn):
-            txn.execute("DROP INDEX IF EXISTS device_lists_outbound_last_success_idx")
-
-        await self.db.runInteraction(
-            "drop_device_lists_outbound_last_success_non_unique_idx", f,
-        )
-        await self.db.updates._end_background_update(
-            BG_UPDATE_DROP_DEVICE_LISTS_OUTBOUND_LAST_SUCCESS_NON_UNIQUE_IDX
-        )
-        return 1
 
 
 class DeviceStore(DeviceWorkerStore, DeviceBackgroundUpdateStore):
@@ -958,17 +987,6 @@ class DeviceStore(DeviceWorkerStore, DeviceBackgroundUpdateStore):
             updatevalues=updates,
             desc="update_device",
         )
-
-    @defer.inlineCallbacks
-    def mark_remote_user_device_list_as_unsubscribed(self, user_id):
-        """Mark that we no longer track device lists for remote user.
-        """
-        yield self.db.simple_delete(
-            table="device_lists_remote_extremeties",
-            keyvalues={"user_id": user_id},
-            desc="mark_remote_user_device_list_as_unsubscribed",
-        )
-        self.get_device_list_last_stream_id_for_remote.invalidate((user_id,))
 
     def update_remote_device_list_cache_entry(
         self, user_id, device_id, content, stream_id
